@@ -223,6 +223,113 @@ netsh nps export filename="C:\nps_backup.xml" exportPSK=YES
 netsh nps show config
 ```
 
+## Part 5.3: Connection Request Policy (CRITICAL - MOST COMMON FAILURE POINT)
+
+**⚠️ WARNING:** This is the #1 cause of "Unable to connect" errors. If you skip this, authentication will fail with no clear error message.
+
+### What is a Connection Request Policy (CRP)?
+
+NPS requires **TWO types of policies**:
+1. **Connection Request Policy (CRP)** - Tells NPS HOW to process requests (locally vs proxy)
+2. **Network Policy** - Defines WHO can authenticate and authorization rules
+
+**Without a CRP, all RADIUS requests are silently rejected before reaching the Network Policy.**
+
+### 5.3.1 Create Connection Request Policy (GUI Method)
+
+1. Open **Network Policy Server** console
+2. Expand **Policies** → Right-click **Connection Request Policies** → **New**
+
+3. **Configure Policy:**
+
+   **Page 1: Policy Name**
+   - Policy name: `Use Windows authentication for all users`
+   - Click **Next**
+
+   **Page 2: Conditions**
+   - Click **Add** → Select **Day and time restrictions**
+   - Click **Add** → Select all days, all hours (24/7)
+   - Click **OK**
+   - Click **Next**
+
+   **Page 3: Settings (CRITICAL)**
+   - Authentication Provider: **Windows Authentication**
+   - Click **Next**
+
+   **Page 4: Complete**
+   - Click **Finish**
+
+4. **Verify:**
+   - Policy should show as **Enabled**
+   - Processing order should be **1**
+
+5. **Restart NPS:**
+   ```powershell
+   Restart-Service -Name IAS
+   ```
+
+### 5.3.2 Alternative: Create CRP via Command Line
+
+```powershell
+# Create Connection Request Policy for local Windows authentication
+netsh nps add crp name="Use Windows authentication for all users" `
+    state=enable `
+    processingorder=1 `
+    policysource=0 `
+    conditionid=0x1006 `
+    conditiondata="0 00:00-24:00; 1 00:00-24:00; 2 00:00-24:00; 3 00:00-24:00; 4 00:00-24:00; 5 00:00-24:00; 6 00:00-24:00" `
+    profileid=0x1025 `
+    profiledata=0x1
+
+# Verify it was created
+netsh nps show crp
+
+# Restart NPS to apply
+Restart-Service -Name IAS
+```
+
+### 5.3.3 Verify CRP Configuration
+
+```powershell
+# Check if CRP exists
+netsh nps show crp
+
+# Expected output should show:
+# Name: Use Windows authentication for all users
+# State: Enabled
+# Processing order: 1
+```
+
+### 5.3.4 Bind PEAP Certificate to NPS
+
+**CRITICAL:** Even with a certificate installed, NPS won't use it until you explicitly bind it.
+
+```powershell
+# Find your server certificate thumbprint
+Get-ChildItem Cert:\LocalMachine\My | Where-Object {
+    $_.EnhancedKeyUsageList.FriendlyName -contains "Server Authentication"
+} | Select Subject, Thumbprint, NotAfter
+
+# Bind certificate to PEAP (replace THUMBPRINT with actual value)
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\RasMan\PPP\EAP\25" `
+    -Name ServerConfigured -Value 1
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\RasMan\PPP\EAP\25" `
+    -Name CertificateThumbprint -Value "YOUR_CERTIFICATE_THUMBPRINT_HERE"
+
+# Verify binding
+Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\RasMan\PPP\EAP\25" |
+    Select ServerConfigured, CertificateThumbprint
+
+# Restart NPS
+Restart-Service -Name IAS
+```
+
+**Expected output:**
+```
+ServerConfigured      : 1
+CertificateThumbprint : ABC123...YOUR_THUMBPRINT
+```
+
 ## Part 6: UniFi Configuration
 
 ### 6.1 Create RADIUS Profile
@@ -375,6 +482,73 @@ Get-Service -Name IAS | Select-Object Name, Status, StartType
 
 ## Part 10: Troubleshooting
 
+### 10.0 Systematic Diagnosis Methodology
+
+When troubleshooting "Unable to connect" errors, follow this diagnostic chain:
+
+**Diagnosis Order:**
+1. **Client-side:** Is the SSID visible and attempting connection?
+2. **NPS-side:** Are RADIUS requests reaching NPS?
+3. **Authentication:** Is NPS processing and rejecting/accepting requests?
+4. **Authorization:** Is the Network Policy allowing access?
+
+### 10.0.1 Quick Diagnostic Script
+
+Run this on the NPS server to check all critical components:
+
+```powershell
+# Quick NPS Health Check
+Write-Host "=== NPS Health Check ===" -ForegroundColor Cyan
+
+# 1. Service Status
+Write-Host "`n[1/6] NPS Service Status" -ForegroundColor Yellow
+Get-Service ias | Select Status, StartType
+
+# 2. UDP Port Listeners
+Write-Host "`n[2/6] RADIUS Port Listeners" -ForegroundColor Yellow
+Get-NetUDPEndpoint -LocalPort 1812,1813 | Select LocalAddress, LocalPort
+
+# 3. Firewall Rules
+Write-Host "`n[3/6] Firewall Rules" -ForegroundColor Yellow
+Get-NetFirewallRule -DisplayGroup "Network Policy Server" |
+    Where-Object {$_.Direction -eq 'Inbound'} |
+    Select DisplayName, Enabled, Action
+
+# 4. Connection Request Policy
+Write-Host "`n[4/6] Connection Request Policy" -ForegroundColor Yellow
+netsh nps show crp
+
+# 5. PEAP Certificate Binding
+Write-Host "`n[5/6] PEAP Certificate Binding" -ForegroundColor Yellow
+Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\RasMan\PPP\EAP\25" |
+    Select ServerConfigured, CertificateThumbprint
+
+# 6. Recent Authentication Events
+Write-Host "`n[6/6] Recent Authentication Events (last 5 minutes)" -ForegroundColor Yellow
+$startTime = (Get-Date).AddMinutes(-5)
+Get-WinEvent -LogName Security -MaxEvents 50 |
+    Where-Object {$_.Id -in @(6272,6273) -and $_.TimeCreated -gt $startTime} |
+    Select TimeCreated, Id, @{N='Result';E={if($_.Id -eq 6272){'Success'}else{'Failure'}}} |
+    Format-Table -AutoSize
+
+Write-Host "`n=== End Health Check ===`n" -ForegroundColor Cyan
+```
+
+### 10.0.2 Enable Comprehensive Logging
+
+```powershell
+# Enable NPS audit logging
+auditpol /set /subcategory:"Network Policy Server" /success:enable /failure:enable
+
+# Enable firewall logging for troubleshooting
+Set-NetFirewallProfile -Profile Domain,Public,Private `
+    -LogBlocked True `
+    -LogFileName "%systemroot%\system32\LogFiles\Firewall\pfirewall.log"
+
+# Verify audit settings
+auditpol /get /subcategory:"Network Policy Server"
+```
+
 ### 10.1 Common Event IDs
 
 | Event ID | Meaning | Action |
@@ -390,9 +564,40 @@ Get-Service -Name IAS | Select-Object Name, Status, StartType
 |------|---------|-----|
 | 8 | No matching policy | Verify policy conditions |
 | 16 | User not authorized | Add user to WiFi-Users group |
+| **49** | **No matching Connection Request Policy** | **CREATE CRP (see Part 5.3) - MOST COMMON ISSUE** |
 | 65 | Shared secret mismatch | Verify RADIUS secret in UniFi matches NPS |
 | 66 | NPS not registered | Run: `netsh nps add registeredserver` |
 | 260 | EAP authentication failed | Check certificate or PEAP settings |
+
+### 10.2.1 CRITICAL: Reason Code 49 - Missing Connection Request Policy
+
+**Symptom:**
+- Client fails immediately after entering credentials
+- Windows error: "Unable to connect to this network" or "Network authentication failed due to a problem with the user account"
+- Event ID 6273 with Reason Code 49
+
+**Diagnosis:**
+```powershell
+# Check if CRP exists
+netsh nps show crp
+```
+
+**If output is empty or shows "Ok." with no policy, you're missing the CRP!**
+
+**Fix:**
+```powershell
+# Create Connection Request Policy
+netsh nps add crp name="Use Windows authentication for all users" `
+    state=enable processingorder=1 policysource=0 `
+    conditionid=0x1006 `
+    conditiondata="0 00:00-24:00; 1 00:00-24:00; 2 00:00-24:00; 3 00:00-24:00; 4 00:00-24:00; 5 00:00-24:00; 6 00:00-24:00" `
+    profileid=0x1025 profiledata=0x1
+
+# Restart NPS
+Restart-Service ias
+
+# Test again - should now work!
+```
 
 ### 10.3 Authentication Fails Immediately
 
@@ -512,22 +717,238 @@ Configure NPS to assign users to different VLANs based on group membership:
 3. Enable RADIUS VLAN support in UniFi:
    - SSID Settings → Advanced → Enable RADIUS Dynamic Authorization
 
-### 12.2 Deploy via Group Policy
+### 12.2 Automated Deployment via Group Policy (Recommended for Production)
 
-Deploy Root CA certificate automatically:
+For organizations with multiple devices, automate WiFi and certificate deployment using Group Policy.
 
-1. **Group Policy Management** → Create new GPO
-2. Edit GPO:
+#### 12.2.1 Overview
+
+**What gets deployed automatically:**
+- ✅ Root CA certificate to all domain computers
+- ✅ WiFi profile with proper security settings
+- ✅ Automatic connection to corporate WiFi after domain join
+- ✅ No manual configuration required on client devices
+
+#### 12.2.2 Create GPO for CA Certificate Deployment
+
+```powershell
+# On Domain Controller
+Import-Module GroupPolicy
+
+# Create GPO for CA certificate
+$caCertGPO = New-GPO -Name "Deploy Root CA Certificate" `
+    -Comment "Deploys internal Root CA to all domain computers"
+
+# Link to domain
+$domain = (Get-ADDomain).DistinguishedName
+New-GPLink -Name "Deploy Root CA Certificate" -Target $domain -LinkEnabled Yes
+
+Write-Output "GPO Created: Deploy Root CA Certificate"
+Write-Output "Next: Configure the GPO via Group Policy Management Console"
+```
+
+**Configure in GPMC:**
+1. Open **Group Policy Management** (`gpmc.msc`)
+2. Navigate to **Forest → Domains → [your domain] → Group Policy Objects**
+3. Right-click **Deploy Root CA Certificate** → **Edit**
+4. Navigate to:
    ```
    Computer Configuration
-     → Policies
-       → Windows Settings
-         → Security Settings
-           → Public Key Policies
-             → Trusted Root Certification Authorities
+    → Policies
+      → Windows Settings
+        → Security Settings
+          → Public Key Policies
+            → Trusted Root Certification Authorities
    ```
-3. Right-click → **Import** → Select Root CA certificate
-4. Link GPO to domain
+5. Right-click **Trusted Root Certification Authorities** → **Import**
+6. Select your Root CA certificate file (e.g., `RootCA.cer`)
+7. Complete the wizard
+8. Close Group Policy Editor
+
+#### 12.2.3 Create GPO for WiFi Profile Deployment
+
+```powershell
+# Create GPO for WiFi profile
+$wifiGPO = New-GPO -Name "Deploy Corporate WiFi Profile" `
+    -Comment "Deploys WPA3-Enterprise WiFi configuration"
+
+# Link to domain
+New-GPLink -Name "Deploy Corporate WiFi Profile" -Target $domain -LinkEnabled Yes
+
+Write-Output "GPO Created: Deploy Corporate WiFi Profile"
+Write-Output "Next: Configure WiFi settings via Group Policy Management Console"
+```
+
+**Configure WiFi Policy in GPMC:**
+
+1. Right-click **Deploy Corporate WiFi Profile** → **Edit**
+2. Navigate to:
+   ```
+   Computer Configuration
+    → Policies
+      → Windows Settings
+        → Security Settings
+          → Wireless Network (IEEE 802.11) Policies
+   ```
+3. Right-click **Wireless Network (IEEE 802.11) Policies** → **Create A New Wireless Network Policy for Windows Vista and Later Releases**
+4. Policy name: `Corporate WiFi Policy`
+5. Click **Add** → **Infrastructure**
+
+**Network Profile Configuration:**
+
+**General Tab:**
+- Profile Name: `YourSSIDName`
+- Network Name (SSID): `YourSSIDName`
+- ✅ Check "Connect automatically when this network is in range"
+- ✅ Check "Connect to a more preferred network if available"
+
+**Security Tab:**
+- Authentication: **WPA2-Enterprise** or **WPA3-Enterprise**
+- Encryption: **AES**
+- Select authentication method: **Microsoft: Protected EAP (PEAP)**
+- Click **Properties**
+
+**PEAP Properties:**
+- ✅ Check "Validate server certificate"
+- Connect to these servers: `your-nps-server.domain.local` (optional but recommended)
+- Trusted Root Certification Authorities:
+  - ✅ Check your Root CA (e.g., "Company-Root-CA")
+- Select Authentication Method: **Secured password (EAP-MSCHAP v2)**
+- Click **Configure** (next to EAP-MSCHAP v2):
+  - ❌ Uncheck "Automatically use my Windows logon name and password"
+  - Click **OK**
+- ✅ Check "Enable Fast Reconnect" (recommended for roaming)
+- Click **OK**
+
+**Connection Tab:**
+- ✅ Check "Connect automatically when this network is in range"
+
+Click **OK** to save the profile.
+
+#### 12.2.4 GPO Deployment and Testing
+
+**Force GPO Update on Test Client:**
+```powershell
+# On Windows client
+gpupdate /force
+
+# Wait 1-2 minutes for policies to apply
+
+# Verify CA certificate was deployed
+Get-ChildItem Cert:\LocalMachine\Root |
+    Where-Object {$_.Subject -like "*YourCA*"}
+
+# Verify WiFi profile was deployed
+netsh wlan show profiles
+```
+
+**Expected Results:**
+- Root CA certificate appears in `Cert:\LocalMachine\Root`
+- WiFi profile appears in network list
+- User can connect by entering AD credentials once
+- Subsequent connections are automatic
+
+#### 12.2.5 Production Deployment Workflow
+
+**For New Laptops:**
+1. Image laptop with Windows
+2. Join to Active Directory domain
+3. Reboot
+4. Group Policy automatically applies (5-10 minutes, or `gpupdate /force`)
+5. WiFi profile and CA certificate deployed
+6. User connects to WiFi → Enters AD credentials once
+7. Windows caches credentials → Future connections are automatic
+
+**For Existing Domain Computers:**
+- Policies apply at next Group Policy refresh (every 90 minutes)
+- Or force immediate application: `gpupdate /force`
+
+#### 12.2.6 GPO Targeting Options
+
+**Option 1: Deploy to All Computers (Default)**
+- Link GPOs to domain root
+- Applies to all domain-joined computers
+
+**Option 2: Deploy to Specific OUs**
+```powershell
+# Create Laptops OU if it doesn't exist
+New-ADOrganizationalUnit -Name "Laptops" -Path "DC=yourdomain,DC=local"
+
+# Link GPOs to Laptops OU only
+$laptopsOU = "OU=Laptops,DC=yourdomain,DC=local"
+New-GPLink -Name "Deploy Root CA Certificate" -Target $laptopsOU
+New-GPLink -Name "Deploy Corporate WiFi Profile" -Target $laptopsOU
+```
+
+**Option 3: Security Group Filtering**
+```powershell
+# Create AD group for WiFi-enabled devices
+New-ADGroup -Name "WiFi-Enabled-Devices" -GroupScope Global -GroupCategory Security
+
+# Add computer accounts to group
+Add-ADGroupMember -Identity "WiFi-Enabled-Devices" -Members "LAPTOP01$", "LAPTOP02$"
+
+# In GPMC: GPO → Delegation → Advanced
+# Add "WiFi-Enabled-Devices" with "Read" and "Apply group policy" permissions
+# Remove "Authenticated Users" if you want exclusive targeting
+```
+
+#### 12.2.7 Troubleshooting GPO Deployment
+
+**Check GPO Application:**
+```powershell
+# On client, check which GPOs are applied
+gpresult /r
+
+# Generate detailed HTML report
+gpresult /h C:\gpresult.html
+# Open gpresult.html and look for:
+# - "Deploy Root CA Certificate" under Computer Configuration
+# - "Deploy Corporate WiFi Profile" under Computer Configuration
+```
+
+**Certificate Not Deployed:**
+```powershell
+# Force computer policy refresh
+gpupdate /force /target:computer
+
+# Check if GPO link is enabled
+Get-GPO -Name "Deploy Root CA Certificate" | Select DisplayName, GpoStatus
+
+# Verify GPO is linked to correct OU/domain
+Get-GPInheritance -Target "DC=yourdomain,DC=local" |
+    Select-Object -ExpandProperty GpoLinks
+```
+
+**WiFi Profile Not Deployed:**
+```powershell
+# Check Wireless Network Policy settings
+Get-NetFirewallRule -DisplayGroup "Network List Manager Policies"
+
+# Verify WLAN AutoConfig service is running
+Get-Service -Name WlanSvc | Select Status, StartType
+
+# Manually refresh wireless profiles
+netsh wlan refresh policy
+```
+
+#### 12.2.8 GPO Maintenance
+
+**Backup GPOs:**
+```powershell
+# Backup all GPOs
+$backupPath = "C:\GPO-Backups\$(Get-Date -Format 'yyyyMMdd')"
+New-Item -Path $backupPath -ItemType Directory -Force
+
+Backup-GPO -All -Path $backupPath
+Write-Output "GPOs backed up to: $backupPath"
+```
+
+**Monitor GPO Application:**
+```powershell
+# Get GPO replication status
+Get-GPOReport -All -ReportType Html -Path "C:\GPO-Report.html"
+```
 
 ### 12.3 EAP-TLS (Certificate-Based Authentication)
 
@@ -662,7 +1083,7 @@ netsh nps show config
 
 ---
 
-**Version:** 1.0
+**Version:** 1.1
 **Last Updated:** 2025-12-30
 **License:** MIT
 **Author:** Homelab Infrastructure Documentation
@@ -670,6 +1091,29 @@ netsh nps show config
 ---
 
 ## Changelog
+
+### v1.1 (2025-12-30) - CRITICAL UPDATE
+- ⚠️ **ADDED Part 5.3: Connection Request Policy (CRP) configuration** - THE MOST COMMON FAILURE POINT
+- ⚠️ **ADDED Section 5.3.4: PEAP Certificate Binding** - Required step often missed
+- ✅ **ADDED Part 10.0: Systematic Diagnosis Methodology** - Step-by-step troubleshooting approach
+- ✅ **ADDED Part 10.0.1: Quick Diagnostic Script** - Automated NPS health check
+- ✅ **ADDED Section 10.2.1: Reason Code 49 Troubleshooting** - Missing CRP diagnosis and fix
+- ✅ **MASSIVELY EXPANDED Part 12.2: Group Policy Deployment** - Complete automated deployment guide
+  - GPO creation scripts
+  - Step-by-step GPMC configuration
+  - Production deployment workflow
+  - Targeting options (OU, Security Groups)
+  - Comprehensive troubleshooting
+  - GPO maintenance and backups
+- 📝 Updated troubleshooting section with real-world diagnosis examples
+- 📝 Added audit logging configuration
+- 📝 Improved firewall configuration guidance
+
+**Breaking Changes:** None - all additions are supplementary
+
+**Migration Notes:**
+- If you previously set up NPS and are experiencing "Unable to connect" errors, check Part 5.3 and Part 10.2.1
+- Existing working configurations are not affected
 
 ### v1.0 (2025-12-30)
 - Initial documentation
