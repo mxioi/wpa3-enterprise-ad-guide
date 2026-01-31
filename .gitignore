@@ -1,0 +1,26 @@
+# Credentials and Secrets
+*.txt
+*_secret*
+*password*
+*credentials*
+nps_backup*.xml
+radius_secret*
+
+# Certificates (private keys)
+*.pfx
+*.p12
+*.key
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
