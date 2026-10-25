@@ -560,14 +560,23 @@ auditpol /get /subcategory:"Network Policy Server"
 
 ### 10.2 Common Reason Codes (Event 6273)
 
-| Code | Meaning | Fix |
+Meanings from Microsoft's [NPS Reason Codes](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-R2-and-2008/dd197570(v=ws.10)) reference. The event's own *Reason* text says the same thing — read it.
+
+| Code | Meaning | Usual fix |
 |------|---------|-----|
-| 8 | No matching policy | Verify policy conditions |
-| 16 | User not authorized | Add user to WiFi-Users group |
-| **49** | **No matching Connection Request Policy** | **CREATE CRP (see Part 5.3) - MOST COMMON ISSUE** |
-| 65 | Shared secret mismatch | Verify RADIUS secret in UniFi matches NPS |
-| 66 | NPS not registered | Run: `netsh nps add registeredserver` |
-| 260 | EAP authentication failed | Check certificate or PEAP settings |
+| 8 | The user account in User-Name does not exist | Check the identity the client actually sent (typo, wrong domain/prefix, a saved Wi-Fi identity) — see 10.7 |
+| 16 | Credentials mismatch: bad user name or password | Re-enter the password; check lockout; a *smart-card-required* account has no usable password (10.7) |
+| 22 | NPS could not negotiate an EAP type with the client | Client and policy must allow the same method (e.g. PEAP) |
+| 23 | Error during EAP | Check the PEAP certificate is saved on **this** NPS (10.9) and EAP logs |
+| 34 / 35 / 36 | Account disabled / expired / locked out | Fix the account in AD |
+| **48** | **No network policy matched** | Identity not in the policy's group (e.g. `WiFi-Users`). Computer accounts (`host/PC…`) land here when the profile tries machine authentication first — harmless if you only allow users |
+| **49** | **No connection request policy matched** | **Create the CRP (see Part 5.3) — the most common setup issue** |
+| 65 | The account's dial-in *Network Access Permission* is **Deny** | Account → Dial-in tab → *Control access through NPS Network Policy* |
+| 66 | Client used an authentication method not enabled on the matching policy | Align the client profile and the policy's EAP types |
+| 260 | RADIUS/EAP message altered (MD5 of the message does not match) | Usually a shared-secret mismatch between the AP/controller and NPS |
+| 265 / 268 / 280 | Client certificate untrusted / expired / not from a valid CA | Only for EAP-TLS/PEAP-TLS |
+
+A shared-secret mismatch more often shows as **System event ID 18** ("Access-Request … with a message authenticator attribute that isn't valid") than as a 6273.
 
 ### 10.2.1 CRITICAL: Reason Code 49 - Missing Connection Request Policy
 
@@ -804,6 +813,67 @@ Get-ADUser -Identity username -Properties PasswordExpired, PasswordLastSet
 # Set password to never expire (not recommended for production)
 Set-ADUser -Identity username -PasswordNeverExpires $true
 ```
+
+### 10.7 "Sign in with current user" fails but typed credentials work
+
+Typed credentials working proves the AP, NPS, policy and certificates are fine — the difference is **the identity Windows sends**.
+
+1. Find the identity in the client log: `Microsoft-Windows-WLAN-AutoConfig/Operational`, event **12013** (802.1X failed) has `Identity=` and `User=` fields; **12012** is the success. `tools/Get-WifiClientEvidence.ps1` prints them.
+2. Find the same attempt on NPS (same minute, `LocalMac` = `Calling-Station-Id`): its reason code tells you why.
+3. Typical causes:
+   - **A saved Wi-Fi identity**, not the Windows account: the profile has `<UseWinLogonCredentials>false</UseWinLogonCredentials>`, so Windows reuses whatever was typed and remembered for that SSID (reason 8 if that name doesn't exist). Re-enter the right credentials, or set `UseWinLogonCredentials` to `true` so "current user" really is the signed-in account.
+   - **The account requires a smart card** (`userAccountControl` includes `0x40000` SMARTCARD_REQUIRED, e.g. 262656 = 0x40000 + 0x200). AD keeps a random password for such accounts, so PEAP-MSCHAPv2 can never succeed for them; use a normal account, or EAP-TLS with certificates.
+   - **Windows Hello / smart-card sign-in**: there is no password to reuse, so password-based SSO cannot work for that session.
+   - **Credential Guard** (Enterprise/Education with VBS) blocks saved/SSO credentials for MSCHAPv2-based Wi-Fi; check `Win32_DeviceGuard.SecurityServicesRunning` contains `1`.
+   - **Machine authentication noise**: `authMode` `machineOrUser` tries `host/<PC>` first; if computers aren't in the group, NPS logs reason 48 every time. Use `authMode` `user` if you don't need Wi-Fi before logon.
+4. `whoami` over SSH/WinRM shows the *remote* session's user — use `quser` or `(Get-CimInstance Win32_ComputerSystem).UserName` for the person at the desk.
+
+### 10.8 Client profile trusts the NPS server certificate instead of the CA root
+
+If a profile was created by clicking **Connect** on the certificate prompt, `TrustedRootCA` may hold the thumbprint of the **NPS server's own certificate** rather than your root CA. It works until that certificate is renewed — or until the *other* NPS answers — and then clients fail or prompt.
+
+```powershell
+# On the client: what does the profile trust?
+netsh wlan export profile name="YOUR-SSID" folder=$env:TEMP    # then look at <TrustedRootCA> and <ServerNames>
+# On each NPS: the certificate thumbprints and their root
+Get-ChildItem Cert:\LocalMachine\My | Select-Object Subject, Thumbprint, NotAfter
+```
+
+Fix: `TrustedRootCA` = the **root CA** thumbprint, `ServerNames` = every NPS server name (`nps1.example.com;nps2.example.com`). Deploy via GPO (Part 12) or re-import the profile **in the user's desktop session** — re-importing a profile clears its saved Wi-Fi credentials, so expect one prompt.
+
+### 10.9 Second NPS server: PEAP certificate not actually saved
+
+The PEAP **Edit** dialog in the NPS console *pre-selects* a suitable certificate even when none is saved, so it looks correct. The setting is stored only after **OK** in that dialog **and** OK/Apply on the policy. Until then the backup NPS can't complete PEAP — you only find out when the primary is down.
+
+Check on every NPS (read-only):
+```powershell
+$x = [xml](Get-Content "$env:windir\System32\ias\ias.xml" -Raw)
+$x.SelectNodes('//*[local-name()="msEAPConfiguration"]') | ForEach-Object { "$($_.ParentNode.ParentNode.GetAttribute('name')): saved" }
+```
+A policy that allows PEAP but is missing from that list has no certificate saved. `tools/Get-NpsEvidence.ps1` does this check and shows the thumbprint in use.
+
+### 10.10 Message-Authenticator hardening (BlastRADIUS, KB5040268)
+
+NPS logs System event **4421** while *RequireMsgAuth / limitProxyState* are disabled. Turn the client-side check on in two steps on **every** NPS:
+
+```cmd
+netsh nps set limitproxystate all=audit
+:: after a day with no audit warnings in the NPS System log:
+netsh nps set limitproxystate all=enable
+netsh nps show limitproxystate
+```
+`requiremsgauth` applies to responses from **remote RADIUS servers** (when NPS proxies) — it has no effect if NPS answers itself. 802.1X/EAP requests always carry Message-Authenticator, so Wi-Fi is not affected; the audit step catches any non-EAP RADIUS client.
+
+### 10.11 Read-only evidence tools
+
+`tools/` contains two scripts that collect everything above without changing anything (no keys, no RADIUS secrets):
+
+| Script | Run on | Shows |
+|---|---|---|
+| `Get-WifiClientEvidence.ps1 -Ssid <SSID>` | the Windows client | signed-in identity and sign-in method, Credential Guard, the profile's EAP XML, policy source, WLAN events with the identity sent and reason codes |
+| `Get-NpsEvidence.ps1 -Hours 6 -Users alice,bob` | **each** NPS server | audit + Message-Authenticator state, 6272/6273/6274 events and a per-user summary, policies and the **saved** PEAP certificate, certificate expiry/chain, account flags (SMARTCARD_REQUIRED) |
+
+Pair client and NPS lines by time and MAC (see 10.7). See `tools/README.md`.
 
 ## Part 11: Security Best Practices
 
